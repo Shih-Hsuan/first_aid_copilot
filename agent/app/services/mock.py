@@ -25,6 +25,13 @@ def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_KEY_ALIASES = {
+    "responsive": "patient.responsive",
+    "breathing_normal": "patient.breathing",
+    "breathing_reported": "patient.breathing",
+}
+
+
 @dataclass
 class Record:
     owner: str
@@ -47,6 +54,7 @@ class SyntheticIncidentService:
         self._lock = RLock()
         self._incidents: dict[UUID, Record] = {}
         self._invites: dict[str, tuple[UUID, CreateShareResponse, UUID | None]] = {}
+        self._invite_failures: dict[str, str] = {}
         self._grants: dict[tuple[str, UUID], tuple[Scope, UUID | None, datetime]] = {}
 
     def create_incident(self, uid: str, body: CreateIncidentRequest) -> IncidentView:
@@ -159,13 +167,16 @@ class SyntheticIncidentService:
                 return previous[1]
             if body.expectedSnapshotRevision != record.view.snapshotRevision:
                 raise stale("snapshotRevision", record.view.snapshotRevision)
+            normalized = []
             for observation in body.observations:
                 value = observation.model_dump(mode="json")
+                value["key"] = _KEY_ALIASES.get(observation.key, observation.key)
+                normalized.append((observation.observationId, value))
                 existing = record.observations.get(observation.observationId)
                 if existing is not None and existing != value:
                     raise ApiError("invalid_input", 409, "Observation ID reused with different content")
-            for observation in body.observations:
-                record.observations[observation.observationId] = observation.model_dump(mode="json")
+            for observation_id, value in normalized:
+                record.observations[observation_id] = value
             record.view.snapshotRevision += 1
             response = SceneObservationResponse(
                 snapshotRevision=record.view.snapshotRevision,
@@ -209,6 +220,7 @@ class SyntheticIncidentService:
             grants = [key for key in self._grants if key[1] == incident_id]
             for key in invites:
                 del self._invites[key]
+                self._invite_failures[key] = "invitation_revoked"
             for key in grants:
                 del self._grants[key]
             record.view.stateRevision += 1
@@ -218,12 +230,20 @@ class SyntheticIncidentService:
 
     def exchange_share(self, uid: str, body: ShareSessionRequest) -> ShareSessionResponse:
         with self._lock:
-            invite = self._invites.pop(sha256(body.secret.encode()).hexdigest(), None)
+            secret_hash = sha256(body.secret.encode()).hexdigest()
+            invite = self._invites.get(secret_hash)
             if not invite:
-                raise ApiError("expired", 403, "Invitation invalid or redeemed")
+                reason = self._invite_failures.get(secret_hash, "invitation_expired")
+                raise ApiError("expired", 403, "Invitation is unavailable", {"reason": reason})
             incident_id, share, helper_id = invite
+            if self._incidents[incident_id].owner == uid:
+                raise ApiError("unauthorized", 403, "Owner cannot redeem invitation", {"reason": "permission_denied"})
             if share.expiresAt <= now():
-                raise ApiError("expired", 403, "Invitation expired")
+                del self._invites[secret_hash]
+                self._invite_failures[secret_hash] = "invitation_expired"
+                raise ApiError("expired", 403, "Invitation expired", {"reason": "invitation_expired"})
+            del self._invites[secret_hash]
+            self._invite_failures[secret_hash] = "invitation_redeemed"
             self._grants[(uid, incident_id)] = (share.scope, helper_id, share.expiresAt)
             return ShareSessionResponse(incidentId=incident_id, scope=share.scope, helperId=helper_id, expiresAt=share.expiresAt)
 
@@ -250,7 +270,7 @@ class SyntheticIncidentService:
             record.update_ids[body.updateId] = (fingerprint, helper_id, response)
             return response
 
-    def list_aeds(self, uid: str, incident_id: UUID, limit: int) -> AedListResponse:
+    def list_aeds(self, uid: str, incident_id: UUID, limit: int, *, lat: float | None = None, lng: float | None = None) -> AedListResponse:
         self.authorize(uid, incident_id, {"primary", Scope.RUNNER.value})
         if self._incidents[incident_id].view.status == IncidentStatus.CLOSED:
             raise ApiError("expired", 403, "Incident closed")
@@ -260,11 +280,23 @@ class SyntheticIncidentService:
         with self._lock:
             view = self.authorize(uid, incident_id, {"primary", Scope.GREETER.value, Scope.EMS.value})
             record = self._incidents[incident_id]
-            from app.schemas.contracts import ObservationInput
+            from app.schemas.contracts import ObservationInput, ObservationRecord
+            observations = []
+            for raw in record.observations.values():
+                item = ObservationInput.model_validate(raw)
+                output = item.model_dump(mode="python")
+                output["source"] = {
+                    "voice_report": "user_report", "manual_report": "user_report",
+                    "button": "button", "camera_proposal": "camera_proposal",
+                }[item.source]
+                output["confirmation"] = {
+                    "user_confirmed": "confirmed", "uncertain": "proposed",
+                    "proposed": "proposed",
+                }[item.confirmation]
+                observations.append(ObservationRecord.model_validate(output))
             return SceneSnapshotResponse(
                 incidentId=incident_id, snapshotRevision=view.snapshotRevision,
-                generatedThroughRevision=view.stateRevision,
-                observations=[ObservationInput.model_validate(item) for item in record.observations.values()],
+                generatedThroughRevision=view.stateRevision, observations=observations,
             )
 
     def handoff_events(self, uid: str, incident_id: UUID, cursor: str | None, limit: int) -> HandoffEventsResponse:

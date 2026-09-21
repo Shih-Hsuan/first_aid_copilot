@@ -1,6 +1,6 @@
 # First Aid Copilot — Software Design Document
 
-Status: local deployment baseline with a partially implemented React / Vite frontend and Flask API. Sections describing clinical rules, AED dispatch/reassignment, offline PWA behavior, and full handoff are target design unless explicitly marked implemented. For callable backend behavior, use [the integration guide](../agent/INTEGRATION.md) and checked [OpenAPI](../agent/openapi.json).
+Status: local deployment baseline with a partially implemented React / Vite frontend and Flask API. The backend now exposes pinned-rule evaluation, normalized PostgreSQL snapshots/MIST, and AED dispatch/reassignment; clinical review, browser feature wiring, and offline PWA behavior remain incomplete. For callable backend behavior, use [the integration guide](../agent/INTEGRATION.md) and checked [OpenAPI](../agent/openapi.json).
 
 Product name: 急救副駕 (First Aid Copilot). Primary interface language: Traditional Chinese (`zh-TW`). Operating context: Taiwan and emergency number 119. Repository collaboration rules are in [AGENTS.md](../AGENTS.md).
 
@@ -10,7 +10,7 @@ Product name: 急救副駕 (First Aid Copilot). Primary interface language: Trad
 
 **The dispatcher leads; the Agent assists.** The product supports reporting, scene records, AED retrieval, and handoff. During dispatcher guidance, it stays silent and presents a reporting cheat sheet, quick-event buttons, a scene snapshot, and helper progress. When a user reports that dispatcher guidance ended or a call could not connect, rule-based voice guidance becomes available.
 
-All participant interfaces are planned in one React browser application; there is no native mobile app. The current frontend has synthetic demo flows, and installable/offline PWA behavior is not implemented yet. PWA installation will be optional. The prototype handles one patient per incident and one primary rescuer browser session, with additional helper and read-only handoff sessions. Patient populations, exclusions, and clinical eligibility must be declared in the reviewed rule package.
+All participant interfaces are planned in one React browser application; there is no native mobile app. The current frontend has synthetic guidance content, an IndexedDB event outbox, and a prepared-shell service worker; installable-PWA metadata and complete offline product wiring are not implemented yet. The TypeScript clinical-rule interpreter exists and passes shared fixtures. PWA installation will be optional. The prototype handles one patient per incident and one primary rescuer browser session, with additional helper and read-only handoff sessions. Patient populations, exclusions, and clinical eligibility must be declared in the reviewed rule package.
 
 | ID | Capability | Required behavior |
 | --- | --- | --- |
@@ -37,19 +37,19 @@ The core demonstration is silent call support, inaccessible-AED reassignment, an
 
 ```mermaid
 flowchart LR
-    Browser[One React PWA: rescuer, helper, EMS] -->|same-origin HTTP and Live WebSocket| Nginx[User-managed Nginx reverse proxy and static files]
+    Browser[One React PWA: rescuer, helper, EMS] -->|same-origin HTTP and Live WebSocket| Nginx[User-managed host Nginx reverse proxy]
     Nginx --> API[Flask API / Live gateway]
     API --> DB[(Local PostgreSQL volume)]
     API --> Gemini[External Gemini Live, optional]
     API --> MapsAPI[External Google Maps APIs, optional]
     Browser --> MapsUI[External Google Maps JS, optional]
-    Browser --> Local[(IndexedDB / service worker, planned)]
+    Browser --> Local[(IndexedDB outbox / service worker shell cache)]
 ```
 
 
 The baseline media path is browser → Flask Live WebSocket gateway → ADK → Gemini Live API. Structured application operations use RESTful JSON over HTTPS. Long-lived credentials stay on the backend. PostgreSQL carries structured state, not raw Live media. The user-managed Nginx is the browser entry point; it runs outside this repository’s Compose stack. The backend is one application with internal modules; Redis is not required for the current prototype.
 
-The current Live gateway accepts authenticated PCM audio and can emit unconfirmed observation proposals; it does not stream speech or clinical instructions. Optional external model operations use Google Gemini. Optional image extraction can run separately from the Live voice session, allowing structured call-mode work to continue with no microphone upload or spoken response. Model IDs are configuration and must be verified against the selected session's language, modality, and tool requirements. [Gemini Live API](https://ai.google.dev/gemini-api/docs/live-api)
+The current Live gateway accepts authenticated PCM audio and emits allowlisted, unconfirmed observation proposals. The browser presents each proposal for an explicit yes, no, or unknown answer, persists the human answer as a confirmed user report, and then requests a pinned rule evaluation. It does not stream Agent speech or improvised clinical instructions; the UI renders fixed template text returned by the rule service and labels unreviewed content. Optional external model operations use Google Gemini. Optional image extraction can run separately from the Live voice session, allowing structured call-mode work to continue with no microphone upload or spoken response. Model IDs are configuration and must be verified against the selected session's language, modality, and tool requirements. [Gemini Live API](https://ai.google.dev/gemini-api/docs/live-api)
 
 | Component | Authority |
 | --- | --- |
@@ -90,9 +90,9 @@ Sections 4–8 specify target product behavior unless a current implementation i
 
 ### 4.1 Rescuer Routes
 
-The current `/` route is a demo entry screen, and `/incidents/:incidentId` is a planned active-incident route. The target UI first shows a large `tel:119` link, one-line scene-safety reminder, speakerphone instructions, and a suggestion to designate another caller. Dial access does not wait for persistent storage, authentication, GPS, or a model session.
+The current `/` route is a demo entry screen, and `/incidents/:incidentId` is a planned active-incident route. The target UI first shows a large telephone link, one-line scene-safety reminder, speakerphone instructions, and a suggestion to designate another caller. The hackathon prototype uses the configured test link `tel:0979796806` and must not dial 119. Dial access does not wait for persistent storage, authentication, GPS, or a model session.
 
-Before handing control to the telephone link, the browser synchronously closes its audio gate and queues a `dial_started` event. The system decides how a telephone link is handled; record only the attempted launch, not a successful connection or enabled speakerphone. The caller enables speakerphone in the system interface and returns to the PWA for the cheat sheet when practical. [Telephone links](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/a#linking_to_telephone_numbers)
+Before handing control to the telephone link, the browser synchronously closes its audio gate and queues `call.reported` with `reportedState: attempted`. The system decides how a telephone link is handled; record only the attempted launch, not a successful connection or enabled speakerphone. `on_call` begins only after the user confirms that the dispatcher is connected; a reported failure enters or continues voice guidance. The caller enables speakerphone in the system interface and returns to the PWA for the cheat sheet when practical. [Telephone links](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/a#linking_to_telephone_numbers)
 
 Call mode presents the cheat sheet, quick buttons, helper progress, and a visual beat when applicable. Voice-guidance mode presents one approved instruction with large `Yes`, `No`, `Unsure`, repeat, correction, and stop-speaking controls. Manual controls report `Dispatcher is on the line`, `Someone else is calling`, `Call ended`, and `Could not connect`. The interface does not imply it can observe the real telephone call.
 
@@ -107,7 +107,7 @@ The cheat sheet is a large-type view of the shared scene snapshot. Its order is 
 | Patient condition | Structured observations with source, confirmation / uncertainty labels, and last-observed time. |
 | Performed actions | Reported actions and their times, kept separate from recommendations and issued commands. |
 | People present | Reported patient and bystander counts plus helper-task summaries; additional patients are outside the single-patient flow. |
-| Hazards | Reported or camera-proposed hazards, with an empty field treated as unknown. |
+| Hazards | Reported or camera-proposed traffic, fire, standing-water, and crowd-obstruction risks, with an empty field treated as unknown. |
 
 In the target scene projection, each field retains its value, source, confirmation state, observation time, and evidence references. Reverse geocoding proposes an address; users confirm or enter landmarks, floor, and access information. Model or camera output cannot silently replace a confirmed fact. The planned deterministic projector produces `snapshotRevision`, `updatedAt`, and the source-event boundary; today `GET snapshot` returns only typed observations and revisions. [Google reverse geocoding](https://developers.google.com/maps/documentation/geocoding/guides-v3/requests-reverse-geocoding)
 
@@ -115,7 +115,7 @@ Quick buttons persist reports before upload and update the local projection imme
 
 ### 4.3 Helper and Handoff Routes
 
-The current `/join/:inviteId` route is a demo screen and does not exchange an invitation. The target flow exchanges a QR invitation for an authenticated grant, then opens `/incidents/:incidentId/helpers/:helperId` or `/incidents/:incidentId/handoff`. The invitation secret travels in the URL fragment, is sent to the exchange endpoint, and is removed from browser history before third-party map resources load. It contains no clinical data.
+The `/join/:inviteId` route exchanges a QR invitation for an authenticated grant, then opens `/incidents/:incidentId/helpers/:helperId` or `/incidents/:incidentId/handoff`. The invitation secret travels in the URL fragment, is sent to the exchange endpoint, and is removed from browser history before third-party map resources load. A non-secret `scope` query controls only pre-exchange wording; the server grant controls post-exchange access and routing. The link contains no clinical data.
 
 An AED runner sees its task, destination, access notes, map / walking route, and return location. It can report arrival, inability to obtain the AED, collection, and delivery. Location permission is requested only for the task; manual status reporting works without it. Tracking is expected only while the helper page is visible, and stale updates are explicitly labeled.
 
@@ -137,7 +137,7 @@ stateDiagram-v2
     voice_guidance --> handover: user_reports_ems_arrived
 ```
 
-The backend currently validates these mode transitions; browser mode controls and its local audio gate are not connected yet. Transitions into `voice_guidance` require the user to report that no dispatcher remains guiding the scene, including calls on another person's phone. A local idle browser, a visible tab, microphone silence, or a network timeout cannot establish that condition.
+The backend validates these mode transitions, and the rescuer controls report them through the IndexedDB outbox while enforcing the local media gate immediately. Transitions into `voice_guidance` require the user to report that no dispatcher remains guiding the scene, including calls on another person's phone. A local idle browser, a visible tab, microphone silence, or a network timeout cannot establish that condition.
 
 | Mode | Permitted behavior |
 | --- | --- |
@@ -150,6 +150,8 @@ The backend currently validates these mode transitions; browser mode controls an
 
 Each mode or pause-policy change increments `modeRevision` locally before server synchronization and invalidates queued output from the previous revision. Entering call mode cancels current playback, flushes queued speech, stops Agent microphone capture, and disables audio timing. Delayed frames and commands from another mode revision are discarded. Reconnection never overrides the local mode.
 
+During voice guidance, local speech activity is treated as barge-in: queued and active Agent playback is stopped immediately while the microphone sample continues through the permitted Live path. This local interruption does not change interaction mode. Every inbound Live message carrying a `modeRevision`, including session and output messages, is discarded unless it matches the current local revision.
+
 When the page becomes hidden, set `guidancePaused`, stop media capture and playback, persist available state, and mark visual timing / local tracking suspended. Visibility changes do not change reported call status. On return, refresh data, display any interruption, and require an explicit user action before restarting voice. Browsers may suspend animations and throttle background timers. [Page visibility and background limits](https://developer.mozilla.org/en-US/docs/Web/API/Page_Visibility_API)
 
 Backend helper services can process reports from other connected participants while the primary tab is suspended. The primary UI catches up when resumed; it must not claim its own browser continued running throughout the interruption.
@@ -158,7 +160,7 @@ Backend helper services can process reports from other connected participants wh
 
 ### 6.1 Rule Package
 
-The planned `rules/` package will contain schemas, flows, approved instruction templates, and shared fixtures; that directory and both interpreters are not present yet. A package includes `schemaVersion`, `ruleVersion`, content hash, supported populations, clinical references, review status, and compatible interpreter versions. Each incident pins one version, which remains available for its active online and offline sessions.
+The `rules/` package contains versioned schemas, the `demo-v1` flow and templates, and shared fixtures. `ClinicalRuleService` runs the Python interpreter and pins the loaded content by rule version and hash. The TypeScript interpreter in `web/src/lib/rules/` validates the same schemas and runs the same fixture index for deterministic offline evaluation. Each incident pins one package version; its IndexedDB bundle retains the content hash and refuses different content under that version. Normal operation accepts only `reviewed` packages; the existing `unreviewed_demo` package is available only through `?demo=1` and must not be presented as approved guidance.
 
 The rule language supports named states, required observations, ordered transitions, explicit unmatched-input behavior, allowlisted actions, template parameters, timer lifecycle events, and interaction-mode interrupts. Conditions are limited to declared comparisons and `all`, `any`, and `not`. Missing observations become `unknown`, never `false`.
 
@@ -168,7 +170,7 @@ Clinical families include assessment, CPR, bleeding control, recovery-position g
 
 ### 6.2 Observation and Decision Contracts
 
-An observation includes `observationId`, allowlisted `key`, typed `value`, `source`, `observedAt`, `receivedAt`, `confirmation`, and `evidenceEventIds`. Boolean observations use `true`, `false`, or `"unknown"`. Sources distinguish voice reports, buttons, camera proposals, and other explicitly supported inputs. A model proposal cannot confirm itself, and a camera frame alone cannot establish a safe scene or normal breathing.
+An observation includes `observationId`, allowlisted `key`, typed `value`, `source`, `observedAt`, `receivedAt`, `confirmation`, and `evidenceEventIds`. Boolean observations use `true`, `false`, or `"unknown"`. Sources distinguish voice reports, buttons, camera proposals, and other explicitly supported inputs. Camera analysis uses `hazards.traffic`, `hazards.fire`, `hazards.standingWater`, `hazards.crowd`, and `patient.bleeding`; the rule adapter maps the last field to `bleeding_severity`. A model proposal cannot confirm itself, and a camera frame alone cannot establish a safe scene or normal breathing.
 
 A `Decision` includes the pinned rule version, accepted observation IDs, source / target clinical state, `reasonCode`, optional approved template ID and parameters, allowed action intents, timer changes, and expected state / mode revisions. Interpreters are pure evaluators; adapters perform external actions only after authorization and revision checks.
 
@@ -180,7 +182,7 @@ Critical instructions are fixed reviewed text, spoken through packaged recording
 
 ### 7.1 Media and Foreground Timing
 
-Microphone and camera access use `getUserMedia` over HTTPS with permission. Audio adapters convert captured samples to the selected Live session format; do not assume compressed `MediaRecorder` output can be forwarded as raw PCM. Camera frames are optional, explicitly enabled, rate-limited, and dropped when stale. Calls are not recorded or transcribed by the Agent. [Browser media capture](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia)
+Microphone and camera access use `getUserMedia` over HTTPS with permission. Audio adapters convert captured samples to the selected Live session format; do not assume compressed `MediaRecorder` output can be forwarded as raw PCM. Camera analysis is deliberately not a Live interaction: the user opens the rear camera, captures one resized JPEG, and reviews five typed proposals after the camera stops. The API accepts at most 700 KB, rejects a stale `modeRevision`, does not persist the raw frame, and requires human confirmation before observations enter the canonical snapshot. Denied camera access or unavailable image analysis leaves manual reporting usable. Calls are not recorded or transcribed by the Agent. [Browser media capture](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia)
 
 Create or resume Web Audio playback from a user gesture and provide a visible enable-audio control when playback is blocked. The shared audio controller owns model playback, template speech, and metronome output, and cancels all of them when mode or pause state prohibits audio. Missing speech voices fall back to approved text or already cached recordings. [Web Audio practices](https://developer.mozilla.org/en-US/docs/Web/API/Web_Audio_API/Best_practices)
 
@@ -190,11 +192,11 @@ Reloads create a new page clock. Restore history, show the interruption, and rec
 
 ### 7.2 PWA Cache and Local Storage
 
-The planned service worker will cache the public app shell, versioned approved templates / recordings, the normalized rule bundle, and permitted government AED-cache assets. No service worker is present in the current frontend. The planned worker must not cache authenticated API responses, invitation secrets, clinical pages as HTML snapshots, raw media, or map tiles. Private records belong in the primary session's controlled IndexedDB store, not a shared HTTP cache.
+The current service worker caches only the prepared public app shell and explicitly approved static assets. It does not cache authenticated API responses, invitation secrets, clinical pages as HTML snapshots, raw media, or map tiles. Versioned rule bundles, approved recordings, and AED-cache assets remain future additions. Private records belong in the primary session's controlled IndexedDB store, not a shared HTTP cache.
 
 Offline readiness requires a completed prior load of the necessary assets and rule version. A first-ever visit without connectivity cannot load an uncached website. Optional installation is not a prerequisite for use and is not proof that all offline resources are ready. Show explicit readiness and missing-resource states. [PWA offline operation](https://developer.mozilla.org/en-US/docs/Web/Progressive_web_apps/Guides/Offline_and_background_operation)
 
-The planned IndexedDB store contains:
+The current IndexedDB store contains incident state, an ordered event outbox, command acknowledgements, and rule-bundle slots. Snapshot projections and AED cache records remain future additions. The target store includes:
 
 - Local incident state, interaction mode, pinned rule metadata, and scene-snapshot projection.
 - An ordered outbox of observations, quick records, mode changes, corrections, and command results.
@@ -232,17 +234,17 @@ The user-facing scene snapshot is distinct from the full incident-state snapshot
 
 ## 8. AED Data and Coordination
 
-The planned Python ETL will normalize the selected Taiwan government AED dataset, validate coordinates, deduplicate source IDs, and preserve names, addresses, opening hours, access notes, source URL, update / ingestion times, and dataset version. No AED dataset or ETL is present yet. Verify the exact source and reuse conditions before ingestion. Missing hours remain unknown, and failed imports retain the last valid dataset.
+The Python ETL supports the Ministry of Health and Welfare national AED CSV listed by the Taiwan Government Data Open Platform. It validates coordinates, deduplicates AED IDs, retains source location IDs, and preserves names, addresses, weekday / weekend opening hours, access notes, source URL, update / ingestion times, dataset version, checksum, and license metadata. The official CSV is downloaded only into an ignored versioned local cache and is not committed. Missing day groups remain unknown, and the atomic cache pointer retains the last valid dataset after a failed download or import. See [`data/aed/README.md`](../data/aed/README.md) for the update command and source details.
 
-The target AED lookup will use geographic candidate filtering, such as geohash bounds with exact-distance filtering, followed by access / availability checks and walking-route estimates. PostgreSQL does not supply the AED dataset automatically. Government records may be cached locally; offline Google map tiles or route-result caching are not assumed.
+The backend AED services implement geographic candidate filtering with exact-distance checks, access / availability checks, walking-route estimates, and incident-scoped exclusions. The normalized PostgreSQL catalog repositories and official cache loader are composed into the Flask API. PostgreSQL does not supply the AED dataset automatically. Government records may be cached locally; offline Google map tiles or route-result caching are not assumed.
 
-The planned estimated return time includes runner → AED and AED → patient, with any retrieval-time assumption labeled separately. After collection, estimate the remaining runner → patient journey. Show estimate age and location accuracy. Maps JavaScript displays the map; Routes API calculates route data. An external navigation link may be offered, with a reminder that leaving the PWA can interrupt tracking. [Routes API](https://developers.google.com/maps/documentation/routes/compute_route_directions)
+The backend retrieval estimate includes runner → AED and AED → patient, with any retrieval-time assumption represented separately. After collection, it estimates the remaining runner → patient journey. The API returns route-source and uncertainty fields; the UI still needs to render the estimate, age, location accuracy, and provider source. Maps JavaScript displays the map; Routes API calculates route data through the provider adapter. An external navigation link may be offered, with a reminder that leaving the PWA can interrupt tracking. [Routes API](https://developers.google.com/maps/documentation/routes/compute_route_directions)
 
-The target helper flow uses `offered`, `accepted`, `en_route`, `arrived`, `collected`, `returning`, and `delivered`, plus `unavailable`, `cancelled`, or `expired`. The current update API accepts only `accepted`, `en_route`, `arrived`, `obtained`, and `unavailable`; it checks the assigned helper and `assignmentRevision` but has no AED assignment engine.
+The domain assignment service uses `offered`, `accepted`, `en_route`, `arrived`, `collected`, `returning`, and `delivered`, plus `unavailable`, `cancelled`, or `expired`. The current update API accepts only `accepted`, `en_route`, `arrived`, `obtained`, and `unavailable`; it checks the assigned helper and `assignmentRevision` but does not call the assignment service.
 
-The planned unavailable-AED flow records a reason, invalidates the old assignment, excludes that candidate for the incident, and selects the next viable destination transactionally. The current API records an `unavailable` helper status only; it does not perform reassignment. In the target flow, the helper acknowledges the updated destination. Repeated reports cannot duplicate assignments; if no candidate remains, report that no accessible candidate is known rather than recycling failed locations.
+The unavailable-AED domain flow records a reason, invalidates the old assignment, excludes that candidate for the incident, and selects the next viable destination with revision checks. The normalized repositories persist assignments, exclusions, and reports. The dedicated Flask unavailable-report endpoint calls the transactional assignment service to exclude and reassign. The generic helper `unavailable` status remains a separate event and does not trigger reassignment. The helper must acknowledge the updated destination. Repeated reports cannot duplicate assignments; if no candidate remains, report that no accessible candidate is known rather than recycling failed locations.
 
-The target helper tracking and reassignment services remain independent of the Live session; the current API only records scoped helper updates. Updates remain visual in call mode. Helpers with visible connected pages can continue reporting while the primary page is offline or hidden; the primary must show those values as stale until it actually receives them.
+Helper tracking and reassignment remain independent of the Live session; the dedicated unavailable-report API invokes the Workstream 5 assignment service. Updates remain visual in call mode. Helpers with visible connected pages can continue reporting while the primary page is offline or hidden; the primary must show those values as stale until it actually receives them.
 
 ## 9. RESTful API, Live Events, and Tools
 
@@ -254,18 +256,23 @@ Structured mutations pass through Flask RESTful JSON endpoints with authenticate
 | `POST /v1/incidents` | Idempotently register a locally generated incident UUID for the authenticated primary client. |
 | `WS /v1/incidents/{id}/live` | Authenticate before accepting media; return current revisions with voice disabled on every connection. The client reconciles REST events before an explicit resume. |
 | `POST /v1/incidents/{id}/event-batches` | Accept bounded ordered event batches online or after an outage; return acknowledgements, conflicts, and current revisions. |
-| `POST /v1/incidents/{id}/scene-observations` | Store typed observations with evidence and expected snapshot revision. Full scene-field projection is not implemented. |
+| `POST /v1/incidents/{id}/scene-observations` | Store typed observations with evidence and expected snapshot revision; project canonical scene sections and actions in the same transaction. |
+| `POST /v1/incidents/{id}/scene-image-analyses` | Analyze one authenticated JPEG/WebP frame into five unconfirmed, allowlisted proposals; requires the current mode revision and never stores the image. |
 | `POST /v1/incidents/{id}/location-descriptions` | Validate authorized coordinates; currently returns `503 unavailable` because geocoding is not connected. |
 | `POST /v1/incidents/{id}/shares` | Create an expiring, participant-scoped invitation. |
 | `POST /v1/incidents/{id}/access-revocations` | Revoke the incident’s pending invitations and active grants with an expected revision. |
 | `POST /v1/share-sessions` | Bind a valid invitation to the invitee’s existing local session and create a scoped grant. |
 | `POST /v1/incidents/{id}/helpers/{helperId}/updates` | Accept only the authorized helper's own location / task reports with the current assignment revision. |
-| `GET /v1/incidents/{id}/aeds` | Currently returns no candidates and `dataUpdatedAt:null`; AED ingestion and routing are not connected. |
-| `GET /v1/incidents/{id}/snapshot` | Return the canonical, revisioned observations to primary, greeter, or EMS. |
+| `GET /v1/incidents/{id}/aeds` | Search the imported AED catalog around reported coordinates; returns no candidates until a dataset is imported. |
+| `GET /v1/incidents/{id}/snapshot` | Return canonical sections, actions, and provenance-bearing observations to primary, greeter, or EMS. |
 | `GET /v1/incidents/{id}/handoff/events` | Return a cursor-paginated, field-filtered timeline to an authorized primary or EMS session. |
-| `PATCH /v1/incidents/{id}` | Change incident status with an expected revision. Closing removes active grants and blocks primary mutations; revoke pending invitations separately before closing. |
+| `GET /v1/incidents/{id}/handoff` | Return canonical snapshot, MIST, and timeline page to primary or EMS. |
+| `POST /v1/incidents/{id}/rule-evaluations` | Preview a pinned Python rule decision at exact state and mode revisions; demo content requires an explicit unreviewed-content flag. |
+| `POST /v1/incidents/{id}/aed-assignments` | Dispatch to a granted AED runner using the imported catalog and reported patient location. |
+| `POST /v1/incidents/{id}/helpers/{helperId}/aed-unavailability-reports` | Authorize the assigned runner and return a revised AED destination or explicit no-candidate result. |
+| `PATCH /v1/incidents/{id}` | Change incident status with an expected revision. Closing revokes pending invitations and active grants and blocks primary mutations. |
 
-These resource-oriented paths replace the earlier `events:sync`, `location:describe`, `share-sessions:exchange`, and `close` action paths. The frontend uses a shared same-origin client and a sessionStorage outbox; feature screens do not own transports. Full IndexedDB recovery and conflict merging remain unimplemented. Workstream 1 owns the Flask routes and contract; workstream 3 updates the shared browser client and offline sync; workstreams 2 and 4 consume the incident, helper, share, AED, and handoff operations; workstream 5 supplies the underlying data services. Existing identifiers, revision checks, error codes, and access rules remain required. For example, a client uploads a synthetic report with `POST /v1/incidents/{id}/event-batches`:
+These resource-oriented paths replace the earlier `events:sync`, `location:describe`, `share-sessions:exchange`, and `close` action paths. The frontend uses a shared same-origin client and an IndexedDB outbox; feature screens do not own transports. Local mode recovery and acknowledgement-based upload are implemented; divergent conflict merging remains unimplemented and is exposed as `resyncing`. Workstream 1 owns the Flask routes and contract; workstream 3 updates the shared browser client and offline sync; workstreams 2 and 4 consume the incident, helper, share, AED, and handoff operations; workstream 5 supplies the underlying data services. Existing identifiers, revision checks, error codes, and access rules remain required. For example, a client uploads a synthetic report with `POST /v1/incidents/{id}/event-batches`:
 
 ```json
 {
@@ -301,30 +308,39 @@ The current `EventInput` schema accepts `mode.changed`, `call.reported`, `action
 | `analyze_scene(image)` | Propose typed snapshot observations; image content cannot override instructions or issue actions. |
 | `update_scene_snapshot(observations, expectedSnapshotRevision)` | Project accepted events while preserving confirmation and uncertainty. |
 
-The tool table is target behavior; current unimplemented clinical and AED tool methods fail closed with `unavailable`. Dial-link activation, mode changes, quick-event buttons, audio gating, and metronome controls are browser actions. They do not wait for a model tool call. A model cannot place a call, claim it connected, or bypass the local gate. Expected API errors include `unauthorized`, `expired`, `stale_revision`, `rule_mismatch`, `unavailable`, and `invalid_input`, mapped to short user-facing messages.
+The model-tool table is target behavior; structured REST endpoints expose rule evaluation and AED reassignment, while unimplemented model tools fail closed with `unavailable`. Dial-link activation, mode changes, quick-event buttons, audio gating, and metronome controls are browser actions. They do not wait for a model tool call. A model cannot place a call, claim it connected, or bypass the local gate. Expected API errors include `unauthorized`, `expired`, `stale_revision`, `rule_mismatch`, `unavailable`, and `invalid_input`, mapped to short user-facing messages.
 
 ## 10. Persistence and Permissions
 
 ### 10.1 PostgreSQL layout and current limits
 
-The current local API stores incident state in a transactional `app_state` JSONB
-row and opaque session token hashes in `local_sessions`. Row locking keeps
-revision and idempotency checks consistent across Flask workers. Incident state
-contains events with separate client/server times, observations, helpers,
-invites, grants, and the canonical snapshot revision. Invite secrets needed for
-idempotent retries are encrypted with `LOCAL_INVITE_KEY`; token and invite
-lookups use hashes. This single-row storage is suitable for the small local
-demo, but it serializes all incident writes and is not a normalized production
-schema. Workstream 5 can replace it behind `IncidentService` without changing
-the HTTP contract.
+The active API stores opaque session token hashes in `local_sessions` and
+normalized incident records in PostgreSQL. The older `app_state` JSONB adapter
+remains selectable only for temporary compatibility with existing prototype
+data; its invitation retry copies use `LOCAL_INVITE_KEY` encryption.
 
-`GET /v1/incidents/{incidentId}/snapshot` returns the same typed observations
-and revision to the primary, greeter, and EMS viewer. A runner cannot read it.
-AED and geocoding data are not seeded or invented: AED search returns an empty
-list with `dataUpdatedAt:null`, while geocoding returns `503 unavailable`.
-Reviewed rule projections, MIST, AED ETL, and scheduled retention cleanup remain to be
-implemented before a clinical demonstration. The current adapter denies incidents
-after 72 hours and purges old state during a later successful API operation.
+Flask now selects the normalized PostgreSQL repositories by default when
+`DATABASE_URL` is set. A `PostgresUnitOfWork` binds event ingestion, incident
+revision update, and scene-snapshot projection to one transaction. The
+`INCIDENT_BACKEND=legacy` setting selects the older JSONB adapter temporarily;
+existing JSONB incidents are not automatically migrated to normalized rows.
+
+The normalized schema stores incidents, append-only events, scene projections,
+invitation hashes, grants, versioned AED datasets, assignments, exclusions,
+unavailable-AED reports, and API idempotency responses. `GET /snapshot` shares
+one canonical projection with primary, greeter, and EMS. `GET /handoff` returns
+that snapshot above evidence-backed MIST and the filtered timeline. A runner
+cannot read clinical data. AED data must be imported; no records are seeded or
+invented. Without a route provider, estimates are explicitly marked as
+straight-line fallback, not walking directions or ETA. Geocoding remains
+`503 unavailable`.
+
+Pinned Python rules are callable through `/rule-evaluations`. The included
+`demo-v1` package is `unreviewed_demo` and is disabled at the API boundary
+unless `ENABLE_UNREVIEWED_DEMO_RULES=1` is set for synthetic training. Clinical review and complete browser integration remain required before
+clinical guidance can be presented as approved. Compose runs forward-only migrations
+before API startup and hourly retention cleanup; authorization enforces expiry
+immediately, independently of physical deletion.
 
 ### 10.2 Identity and Access
 
@@ -335,16 +351,16 @@ QR invitations contain high-entropy secrets; lookups use hashes and retry copies
 | Actor | Allowed access |
 | --- | --- |
 | Primary session | Its incident, scene snapshot, observations / records, mode controls, and sharing operations. |
-| AED runner | Its own task / location update endpoint and empty AED-candidate response; retrieval view is planned. No clinical snapshot, MIST, or complete timeline. |
+| AED runner | Its own task / location and AED-unavailability endpoints, plus AED candidates from an imported dataset. Workstream 4 must render the new assignment response. No clinical snapshot, MIST, or complete timeline. |
 | Ambulance greeter | Shared observation snapshot and its own task / location update endpoint; meeting-task view and condition / action summaries are planned. No full clinical timeline or other helpers' location histories. |
-| EMS viewer | Shared observation snapshot and sanitized timeline until expiry; MIST projection is planned. No mutation permission. |
+| EMS viewer | Shared observation snapshot and sanitized timeline until expiry. The API exposes canonical MIST; Workstream 4 must render it. No mutation permission. |
 | Backend process | Validated canonical writes and projections through PostgreSQL credentials kept inside the API container. |
 
 The browser has no direct PostgreSQL access. Flask validates session token hashes, incident ownership, grant scope, and expiry for each API read or write. An incident ID is not permission, and readable response bodies must not contain fields that their viewers should not see.
 
 ## 11. Deployment, Privacy, and Failure Handling
 
-Docker Compose starts `web` (a multi-stage Vite build served by a lightweight Node HTTP server with SPA fallback), `api` (Flask / Gunicorn), and `db` (PostgreSQL with a named volume). It does not run Nginx. Web and API publish only on host loopback at configurable `WEB_PORT` and `API_PORT`; PostgreSQL has no host port. User-managed host Nginx on ports 80/443 sends ordinary pages to the web port and sends `/v1/` plus `/healthz` to the API port without rewriting paths, preserving WebSocket Upgrade for Live. Run `./scripts/setup-local.sh`, then `docker compose up --build -d`; `node scripts/smoke-local.mjs` verifies the direct local stack. `PUBLIC_ORIGIN` must match the browser origin for Live WebSocket checks. A phone connecting over a LAN needs trusted HTTPS at the user-managed Nginx before browser microphone or camera access is available.
+Docker Compose starts `web` (a multi-stage Vite build served by a lightweight Node HTTP server with SPA fallback), `api` (Flask / Gunicorn), `db` (PostgreSQL with a named volume), one-shot `migrate`, and hourly `retention`. It does not run Nginx. Web and API publish only on host loopback at configurable `WEB_PORT` and `API_PORT`; PostgreSQL has no host port. User-managed host Nginx on ports 80/443 sends ordinary pages to the web port and sends `/v1/` plus `/healthz` to the API port without rewriting paths, preserving WebSocket Upgrade for Live. Run `./scripts/setup-local.sh`, then `docker compose up --build -d`; `node scripts/smoke-local.mjs` verifies the direct local stack. `PUBLIC_ORIGIN` must match the browser origin for Live WebSocket checks. A phone connecting over a LAN needs trusted HTTPS at the user-managed Nginx before browser microphone or camera access is available.
 
 Never place long-lived Gemini credentials or private session/invitation keys in `VITE_*` variables; browser map keys must be origin- and API-restricted. A Docker deployment is local even though Gemini Live and Google Maps remain external services when enabled.
 
@@ -354,7 +370,14 @@ Configuration includes model IDs, rule package versions, permitted origins, supp
 
 Do not request patient names, identity numbers, or contact details. Location and medical observations remain sensitive. Raw audio, frames, and full transcripts are not retained by default; logs exclude clinical payloads, precise coordinates, and credentials. Provider data handling must be verified before claiming any retention guarantee.
 
-Sessions, grants, and incidents have expiry checks at authorization time. A new session deletes expired session rows; a later successful incident operation purges incidents older than 72 hours and expired grants/invites. Scheduled cleanup remains an implementation gap for idle databases. Local stores are purged on open / resume and closure according to their retention rules; a closed browser cannot guarantee deletion at an exact wall-clock instant.
+Sessions, grants, and incidents have expiry checks at authorization time. A new
+session deletes expired session rows; a later successful incident operation
+purges incidents older than 72 hours and expired grants/invites. Deployments can
+invoke `python -m app.services.postgres_data cleanup` from cron or a host timer
+to clean idle databases; the repository does not add another scheduler service.
+Local stores are purged on open / resume and closure according to their
+retention rules; a closed browser cannot guarantee deletion at an exact
+wall-clock instant.
 
 Helper / EMS pages keep clinical view state in memory and clear it on grant expiry or sign-out. Revocation stops future access but cannot erase information already seen. Incident closure stops media / location capture, cancels active operations, and retains only what the configured handoff and retention policies allow.
 
@@ -380,7 +403,7 @@ These are implementation requirements, not claims of existing tests or clinical 
 | --- | --- |
 | One web application | Rescuer, runner, greeter, and EMS routes build from one Vite project and work without installation on the documented browser profiles. |
 | Shared rules | Python and TypeScript pass the same cases, including unknown inputs, conflicting observations, mode interrupts, and timer changes. |
-| Emergency entry | 119 access is present before permission, storage, network, or model initialization; launch is not recorded as a connected call. |
+| Emergency entry | The configured test-number access is present before permission, storage, network, or model initialization; launch is recorded only as attempted, never as a connected call. |
 | Call-mode silence | Explicit call entry stops Agent speech, microphone upload, queued prompts, and metronome audio, including during AED reassignment. |
 | Mode transitions | Call end / failure requires user reporting; redial immediately silences any clinical child flow. Visibility and network changes cannot unmute the session. |
 | Media | Permission denial, blocked playback, selected-frame capture, and user-gesture activation have usable fallbacks. |
@@ -445,4 +468,4 @@ mchackathon/
     └── sdd.md
 ```
 
-This layout defines implementation boundaries without requiring empty scaffolding. Clinical content, reporting-field wording, actual browser profiles, model identifiers, the AED source, and retention settings remain explicit validation / configuration decisions. Coordination and ownership rules stay in `AGENTS.md`; this document specifies the product and system design.
+This layout defines implementation boundaries without requiring empty scaffolding. Clinical content, reporting-field wording, actual browser profiles, model identifiers, and retention settings remain explicit validation / configuration decisions. The AED source and local update procedure are documented in [`data/aed/README.md`](../data/aed/README.md). Coordination and ownership rules stay in `AGENTS.md`; this document specifies the product and system design.
